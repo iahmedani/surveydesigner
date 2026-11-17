@@ -1,13 +1,18 @@
 import re
 
 from django.db import transaction
-from django.db.models.signals import post_save, pre_save
+from django.db.models import Q
+from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
+from modules.signals import invalidate_module_cache_on_commit
 from questions.models import (
     BaseQuestion,
     RepeatSection,
     RootQuestion,
     RootQuestionTranslation,
+    SubmoduleQuestionConfig,
+    SubmoduleQuestionConfigConstraintMessageTranslation,
+    SubmoduleQuestionConfigTranslation,
     SubQuestion,
 )
 
@@ -107,6 +112,43 @@ _OWN_EXPRESSION_FIELDS = (
 )
 
 
+# Text fields of per-submodule configurations that may reference ${name}.
+# Configs have no dependency M2Ms, so candidates are found by containment.
+_CONFIG_TOKEN_FIELDS = {
+    SubmoduleQuestionConfig: (
+        *_OWN_EXPRESSION_FIELDS,
+        "label",
+        "hint",
+        "constraint_message",
+    ),
+    SubmoduleQuestionConfigTranslation: ("label", "hint"),
+    SubmoduleQuestionConfigConstraintMessageTranslation: ("label",),
+}
+
+
+def _replace_tokens_in_fields(model, fields, token, pattern, replacement) -> int:
+    """Rewrite ``token`` in any of ``fields`` of rows containing it."""
+    condition = Q()
+    for field in fields:
+        condition |= Q(**{f"{field}__contains": token})
+    to_update = []
+    changed_fields = set()
+    for obj in model.objects.filter(condition).only("pk", *fields).iterator():
+        changed = False
+        for field in fields:
+            value = getattr(obj, field) or ""
+            new_value = pattern.sub(replacement, value)
+            if new_value != value:
+                setattr(obj, field, new_value)
+                changed_fields.add(field)
+                changed = True
+        if changed:
+            to_update.append(obj)
+    if to_update:
+        model.objects.bulk_update(to_update, sorted(changed_fields))
+    return len(to_update)
+
+
 def _model_has_field(model, fname: str) -> bool:
     return any(getattr(f, "name", None) == fname for f in model._meta.get_fields())
 
@@ -182,6 +224,15 @@ def _update_references_after_rename(instance, created: bool):
         for qs, field in label_fields:
             _bulk_replace_field(qs.only(field), field, token_pat, replacement)
 
+        configs_changed = 0
+        for model, fields in _CONFIG_TOKEN_FIELDS.items():
+            configs_changed += _replace_tokens_in_fields(
+                model, fields, token, token_pat, replacement
+            )
+        if configs_changed:
+            # bulk_update sends no post_save, so invalidate explicitly.
+            invalidate_module_cache_on_commit()
+
         # The renamed question's own expressions refer to it by the old name
         # too. Update the instance as well, so callers that keep using it
         # (dependency sync, a later save) see the new name.
@@ -194,3 +245,14 @@ def _update_references_after_rename(instance, created: bool):
                 setattr(instance, field, new_value)
         if own_changes:
             type(instance).objects.filter(pk=instance.pk).update(**own_changes)
+
+
+# Per-submodule configurations feed the cached modules/submodules API.
+@receiver(post_save, sender=SubmoduleQuestionConfig)
+@receiver(post_delete, sender=SubmoduleQuestionConfig)
+@receiver(post_save, sender=SubmoduleQuestionConfigTranslation)
+@receiver(post_delete, sender=SubmoduleQuestionConfigTranslation)
+@receiver(post_save, sender=SubmoduleQuestionConfigConstraintMessageTranslation)
+@receiver(post_delete, sender=SubmoduleQuestionConfigConstraintMessageTranslation)
+def handle_submodule_question_config_change(sender, instance, **kwargs):
+    invalidate_module_cache_on_commit()

@@ -20,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from pyxform.aliases import BINDING_CONVERSIONS
 from pyxform.utils import default_is_dynamic
 
-from .form_validation import ValidationIssue
+from .form_validation import ValidationIssue, owner_config_note
 
 QUESTION_EXPRESSION_FIELDS = (
     "relevant",
@@ -280,7 +280,8 @@ class ExpressionContext:
             code=code,
             layer=self.layer,
             severity="error",
-            message=f"{label} field '{self.field}' {message}",
+            message=f"{label} field '{self.field}' {message}"
+            + owner_config_note(self.owner),
             owner=dict(self.owner),
             field=self.field,
             sheet=self.sheet,

@@ -18,6 +18,9 @@ from questions.models import (
     RepeatSectionTranslation,
     RootQuestion,
     RootQuestionTranslation,
+    SubmoduleQuestionConfig,
+    SubmoduleQuestionConfigConstraintMessageTranslation,
+    SubmoduleQuestionConfigTranslation,
     SubQuestion,
     SubQuestionTranslation,
     Suffix,
@@ -28,6 +31,16 @@ from questions.serializers import (
     SubQuestionExportSerializer,
 )
 
+from .questions_import.submodule_question_configs import (
+    CHOICE_FILE_COLUMN,
+    CHOICE_LIST_COLUMN,
+    LANGUAGE_FIELDS,
+    PLAIN_FIELDS,
+    QUESTION_COLUMN,
+    SHEET_NAME as SUBMODULE_QUESTION_CONFIGS_SHEET,
+    SUBMODULE_COLUMN,
+    sheet_columns,
+)
 from .workbook import save_virtual_workbook
 
 
@@ -89,6 +102,8 @@ class QuestionsExport:
         "indicator_name": "mandatory",
         "indicator_label": "mandatory",
         "question_name": "mandatory",
+        "submodule_name": "mandatory",
+        "choice_file": "mandatory if type = select one/multiple from file",
     }
 
     ENGLISH_LANGUAGES = {
@@ -111,6 +126,12 @@ class QuestionsExport:
         self.recall_period_sheet = self.wb.create_sheet(title="recall_periods")
         self.required_groups_sheet = self.wb.create_sheet(title="required_groups")
         self.indicators_sheet = self.wb.create_sheet(title="indicators")
+        self.submodule_question_configs_sheet = self.wb.create_sheet(
+            title=SUBMODULE_QUESTION_CONFIGS_SHEET
+        )
+        # None = configs of every submodule; set by submodule/module exports.
+        self.config_submodule_ids = None
+        self.submodule_question_configs = []
         self.current_row_index = 1
         self.repeat_section_ids = set()
         self.choices_ids = set()
@@ -548,9 +569,74 @@ class QuestionsExport:
         self.add_recall_periods()
         self.add_required_groups()
         self.add_indicators()
+        self.add_submodule_question_configs()
+
+    def _load_submodule_question_configs(self, base_question_queryset):
+        """Configs of the exported questions (and submodules, when scoped)."""
+
+        configs = SubmoduleQuestionConfig.objects.filter(
+            base_question__in=base_question_queryset.values("id")
+        )
+        if self.config_submodule_ids is not None:
+            configs = configs.filter(submodule_id__in=self.config_submodule_ids)
+        self.submodule_question_configs = list(
+            configs.select_related(
+                "submodule",
+                "base_question__root_question",
+                "base_question__sub_question",
+                "choices",
+                "choices_file",
+            )
+            .prefetch_related("translations", "constraint_translations")
+            .order_by("submodule__name", "base_question__order", "id")
+        )
+
+    def add_submodule_question_configs(self):
+        """One full row per SubmoduleQuestionConfig (see the importer)."""
+
+        sheet = self.submodule_question_configs_sheet
+        header = sheet_columns(self.languages)
+        columns = enum.Enum("Columns", header)
+        self._fill_column_header(columns, sheet)
+        index = {name: position + 1 for position, name in enumerate(header)}
+        for row, config in enumerate(self.submodule_question_configs, 2):
+            self.row_source_map[(sheet.title, row)] = {
+                "model": "SubmoduleQuestionConfig",
+                "id": config.id,
+                "name": config.question_name,
+            }
+            values = {
+                SUBMODULE_COLUMN: config.submodule.name,
+                QUESTION_COLUMN: config.question_name,
+                CHOICE_LIST_COLUMN: config.choices.name if config.choices else "",
+                CHOICE_FILE_COLUMN: (
+                    config.choices_file.name if config.choices_file else ""
+                ),
+                **{field: getattr(config, field) for field in PLAIN_FIELDS},
+            }
+            translations = {t.language: t for t in config.translations.all()}
+            constraint_translations = {
+                t.language: t.label for t in config.constraint_translations.all()
+            }
+            for field in LANGUAGE_FIELDS:
+                if not self.languages:
+                    values[field] = getattr(config, field)
+                    continue
+                for code, display in self.languages:
+                    column = f"{field}::{display} ({code})"
+                    if code == "en":
+                        values[column] = getattr(config, field)
+                    elif field == "constraint_message":
+                        values[column] = constraint_translations.get(code, "")
+                    elif code in translations:
+                        values[column] = getattr(translations[code], field)
+            for column, value in values.items():
+                if column in index and value not in (None, ""):
+                    sheet.cell(row=row, column=index[column], value=value)
 
     def set_values_from_questions(self, base_question_queryset):
         self._set_question_ids_from_questions(base_question_queryset)
+        self._load_submodule_question_configs(base_question_queryset)
         self._set_repeat_section_ids_from_questions(base_question_queryset)
         self._set_choice_ids_from_questions(base_question_queryset)
         self._set_languages_from_questions()
@@ -585,8 +671,19 @@ class QuestionsExport:
             ).values_list("sub_question__suffix_2__choices", flat=True)
         )
 
+        config_choices = [
+            config.choices_id
+            for config in self.submodule_question_configs
+            if config.choices_id
+        ]
+
         self.choice_groups = list(
-            set(root_question_choices + suffix_choices + suffix_2_choices)
+            set(
+                root_question_choices
+                + suffix_choices
+                + suffix_2_choices
+                + config_choices
+            )
         )
 
         self.choices_ids = (
@@ -629,8 +726,23 @@ class QuestionsExport:
             ).values_list("language", flat=True)
         )
 
+        config_ids = [config.id for config in self.submodule_question_configs]
+        config_languages = list(
+            SubmoduleQuestionConfigTranslation.objects.filter(
+                config__in=config_ids
+            ).values_list("language", flat=True)
+        ) + list(
+            SubmoduleQuestionConfigConstraintMessageTranslation.objects.filter(
+                config__in=config_ids
+            ).values_list("language", flat=True)
+        )
+
         language_set = set(
-            root_languages + sub_languages + choice_languages + repeat_section_languages
+            root_languages
+            + sub_languages
+            + choice_languages
+            + repeat_section_languages
+            + config_languages
         )
         language_set.discard("en")
 
@@ -649,6 +761,9 @@ class QuestionsExport:
         return save_virtual_workbook(self.wb)
 
     def generate_from_submodules(self, submodule_queryset):
+        self.config_submodule_ids = list(
+            submodule_queryset.values_list("id", flat=True)
+        )
         root_questions_queryset = RootQuestion.objects.filter(
             submodule__in=submodule_queryset
         )
@@ -668,6 +783,9 @@ class QuestionsExport:
 
     def generate_from_modules(self, modules_queryset):
         submodule_queryset = Submodule.objects.filter(module__in=modules_queryset)
+        self.config_submodule_ids = list(
+            submodule_queryset.values_list("id", flat=True)
+        )
         root_questions_queryset = RootQuestion.objects.filter(
             submodule__in=submodule_queryset
         )

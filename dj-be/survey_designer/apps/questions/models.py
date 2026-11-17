@@ -520,6 +520,222 @@ class RepeatSection(BaseWFPModelMixin):
     )
 
 
+class SubmoduleQuestionConfig(UserTrackingMixin, TimestampMixin, QuestionFieldsMixin):
+    """Submodule-specific configuration of a shared root or sub-question.
+
+    The question's ``name`` and ``type`` stay global (names are unique across
+    the bank). Every other field is a *full copy* made when the configuration
+    is created (see ``create_from_question``); afterwards it is independent of
+    the shared question. When a config exists for ``(submodule, question)``,
+    generation uses it instead of the shared question's fields. Deleting the
+    config reverts the submodule to the shared question.
+    """
+
+    submodule = models.ForeignKey(
+        "modules.Submodule",
+        related_name="question_configs",
+        on_delete=models.CASCADE,
+    )
+    base_question = models.ForeignKey(
+        BaseQuestion,
+        related_name="submodule_configs",
+        on_delete=models.CASCADE,
+        help_text="A root question or a sub-question (not a repeat section).",
+    )
+    label = models.TextField("Label (en)")
+    choices = models.ForeignKey(
+        "ChoiceGroup",
+        related_name="submodule_question_configs",
+        on_delete=models.PROTECT,
+        blank=True,
+        null=True,
+    )
+    choices_file = models.ForeignKey(
+        "ChoiceGroupFile",
+        related_name="submodule_question_configs",
+        on_delete=models.PROTECT,
+        blank=True,
+        null=True,
+    )
+
+    class Meta:
+        verbose_name = "Submodule question configuration"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["submodule", "base_question"],
+                name="unique_submodule_question_config",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.submodule} / {self.question_name}"
+
+    @property
+    def question(self):
+        """The shared RootQuestion or SubQuestion this config customises."""
+        return self.base_question.root_question or self.base_question.sub_question
+
+    @property
+    def question_name(self):
+        question = self.question
+        return question.name if question else ""
+
+    @property
+    def type(self):
+        question = self.question
+        return question.type if question else ""
+
+    def _root_question(self):
+        question = self.question
+        if isinstance(question, SubQuestion):
+            return question.root_question
+        return question
+
+    def clean(self):
+        errors = {}
+        if self.base_question_id:
+            question = self.question
+            if question is None:
+                errors["base_question"] = (
+                    "Only root questions and sub-questions can be configured "
+                    "per submodule."
+                )
+            elif self.submodule_id:
+                root = self._root_question()
+                if not root.submodule.filter(pk=self.submodule_id).exists():
+                    errors["base_question"] = (
+                        f"Question '{question.name}' is not part of submodule "
+                        f"'{self.submodule}'."
+                    )
+            if question is not None:
+                # Same choice rules as RootQuestion.clean(), on the effective type.
+                question_type = question.type
+                if question_type in (
+                    QuestionType.SELECT_ONE_FROM_FILE,
+                    QuestionType.SELECT_MULTIPLE_FROM_FILE,
+                ):
+                    if not self.choices_file:
+                        errors["choices_file"] = (
+                            f"choices_file is required for question type "
+                            f"'{question_type}'."
+                        )
+                    if self.choices:
+                        errors["choices"] = (
+                            "Cannot set both 'choices' and 'choices_file'. Use "
+                            "'choices_file' for file-based question types."
+                        )
+                elif question_type in (
+                    QuestionType.SELECT_ONE,
+                    QuestionType.SELECT_MULTIPLE,
+                ):
+                    if not self.choices:
+                        errors["choices"] = (
+                            f"choices is required for question type "
+                            f"'{question_type}'."
+                        )
+                    if self.choices_file:
+                        errors["choices_file"] = (
+                            "Cannot set both 'choices' and 'choices_file'. Use "
+                            "'choices' for regular question types."
+                        )
+        if errors:
+            raise ValidationError(errors)
+        super().clean()
+
+    def get_xls_type(self):
+        question_type = self.type
+        if question_type in (QuestionType.SELECT_ONE, QuestionType.SELECT_MULTIPLE):
+            if self.choices:
+                return f"{question_type} {self.choices.name}"
+        elif question_type in (
+            QuestionType.SELECT_ONE_FROM_FILE,
+            QuestionType.SELECT_MULTIPLE_FROM_FILE,
+        ):
+            if self.choices_file and self.choices_file.csv_file:
+                filename = os.path.basename(self.choices_file.csv_file.name)
+                return f"{question_type} {filename}"
+        return question_type
+
+    COPIED_FIELDS = (
+        "label",
+        "hint",
+        "relevant",
+        "constraint",
+        "constraint_message",
+        "appearance",
+        "required",
+        "parameters",
+        "disabled",
+        "read_only",
+        "default",
+        "choice_filter",
+        "calculation",
+    )
+
+    def fill_from_question(self, question):
+        """Copy fields and the effective choice list (not translations) from
+        the shared ``question`` onto this (possibly unsaved) config."""
+        for field in self.COPIED_FIELDS:
+            setattr(self, field, getattr(question, field))
+        effective_choices = question.choices
+        if isinstance(question, RootQuestion) and question.choices_file_id:
+            effective_choices = question.choices_file
+        self.choices = (
+            effective_choices if isinstance(effective_choices, ChoiceGroup) else None
+        )
+        self.choices_file = (
+            effective_choices
+            if isinstance(effective_choices, ChoiceGroupFile)
+            else None
+        )
+
+    @classmethod
+    def create_from_question(cls, submodule, base_question, user=None):
+        """Full copy of the shared question's configuration into ``submodule``.
+
+        Copies every field except name/type, the effective choice list (for a
+        sub-question: inherited from suffix_2 -> suffix -> root) and all label,
+        hint and constraint-message translations.
+        """
+        question = base_question.root_question or base_question.sub_question
+        if question is None:
+            raise ValidationError(
+                "Only root questions and sub-questions can be configured per submodule."
+            )
+        config = cls(
+            submodule=submodule,
+            base_question=base_question,
+            created_by=user,
+            updated_by=user,
+        )
+        config.fill_from_question(question)
+        config.full_clean()
+        config.save()
+
+        SubmoduleQuestionConfigTranslation.objects.bulk_create(
+            SubmoduleQuestionConfigTranslation(
+                config=config,
+                language=translation.language,
+                label=translation.label,
+                hint=translation.hint,
+                created_by=user,
+                updated_by=user,
+            )
+            for translation in question.translations.all()
+        )
+        SubmoduleQuestionConfigConstraintMessageTranslation.objects.bulk_create(
+            SubmoduleQuestionConfigConstraintMessageTranslation(
+                config=config,
+                language=translation.language,
+                label=translation.label,
+                created_by=user,
+                updated_by=user,
+            )
+            for translation in question.constraint_translations.all()
+        )
+        return config
+
+
 # Translations:
 
 
@@ -577,3 +793,24 @@ class RepeatSectionTranslation(BaseTranslationMixin):
 
     class Meta:
         unique_together = ["repeat_section", "language"]
+
+
+class SubmoduleQuestionConfigTranslation(BaseTranslationMixin):
+    config = models.ForeignKey(
+        SubmoduleQuestionConfig, related_name="translations", on_delete=models.CASCADE
+    )
+    hint = models.TextField(blank=True)
+
+    class Meta:
+        unique_together = ["config", "language"]
+
+
+class SubmoduleQuestionConfigConstraintMessageTranslation(BaseTranslationMixin):
+    config = models.ForeignKey(
+        SubmoduleQuestionConfig,
+        related_name="constraint_translations",
+        on_delete=models.CASCADE,
+    )
+
+    class Meta:
+        unique_together = ["config", "language"]

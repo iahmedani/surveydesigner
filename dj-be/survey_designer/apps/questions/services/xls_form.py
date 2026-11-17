@@ -29,9 +29,11 @@ from questions.models import (
     SubQuestion,
     SubQuestionTranslation,
 )
+
 from survey_designer import ___version___ as SURVEY_DESIGNER_VERSION
 
 from .form_validation import ExternalChoiceFileSource
+from .question_config import QuestionConfigResolver, config_reference
 from .workbook import save_virtual_workbook
 
 
@@ -101,6 +103,10 @@ class XLSForm:
         self.submodules_order = submodules_order
         self.selected_submodule_ids = submodule_ids
         self.submodule_ids = self.get_submodule_ids()
+        # Per-submodule question configurations, loaded once for the survey.
+        self.config_resolver = QuestionConfigResolver(
+            self.submodule_ids, languages=self.language_values
+        )
         self.module_ids = self.get_module_ids()
         self.modules = self.get_modules()
         self.current_module = None
@@ -378,32 +384,31 @@ class XLSForm:
             self.fill_cell("name", name)
             self.fill_cell("default", default)
 
-    def _track_external_file(self, question):
+    def _track_external_file(self, question, effective):
+        """Record the effective choice file of one emitted question."""
+
         if question.type not in (
             QuestionType.SELECT_ONE_FROM_FILE,
             QuestionType.SELECT_MULTIPLE_FROM_FILE,
         ):
             return
 
-        choices_file = None
-        if hasattr(question, "choices_file") and question.choices_file:
-            choices_file = question.choices_file
-        else:
-            choices = getattr(question, "choices", None)
-            if choices is not None and hasattr(choices, "csv_file"):
-                choices_file = choices
-
+        choices_file = effective.choices_file
         file_field = getattr(choices_file, "csv_file", None)
         file_name = os.path.basename(str(getattr(file_field, "name", "") or ""))
+        owner = self._reference_source(question)
+        config = config_reference(effective.source_config)
+        if config:
+            owner["config"] = config
         self.external_file_sources.append(
             ExternalChoiceFileSource(
                 filename=file_name,
                 file_obj=file_field,
-                owner=self._reference_source(question),
+                owner=owner,
                 file_owner=self._reference_source(choices_file),
                 question_type=str(question.type),
-                parameters=str(getattr(question, "parameters", "") or ""),
-                choice_filter=str(getattr(question, "choice_filter", "") or ""),
+                parameters=str(effective.parameters or ""),
+                choice_filter=str(effective.choice_filter or ""),
             )
         )
         if file_name and file_name not in self.external_files:
@@ -424,13 +429,16 @@ class XLSForm:
             self._reference_source(instance)
         )
 
-    def _record_question_source(self, question):
+    def _record_question_source(self, question, effective):
         source = {
             "model": question.__class__.__name__,
             "id": question.id,
             "name": question.name,
         }
-        choices = question.choices
+        config = config_reference(effective.source_config)
+        if config:
+            source["config"] = config
+        choices = effective.choices
         if isinstance(choices, ChoiceGroup):
             source["choice_filter_list"] = self._reference_source(
                 choices.choice_filter_list
@@ -448,58 +456,66 @@ class XLSForm:
                     "recall_period": self._reference_source(question.recall_period),
                     "effective_type": question.type,
                     "effective_choice_list": (
-                        question.choices.name if question.choices else ""
+                        effective.choice_source.name if effective.choice_source else ""
                     ),
                 }
             )
         self.row_source_map[("survey", self.current_row_index)] = source
 
-    def add_question_row(self, question):
+    def add_question_row(self, question, submodule):
+        """Emit one root/sub-question with its effective values in ``submodule``."""
+
+        effective = self.config_resolver.resolve(question, submodule.id)
         self.increment_row_index()
-        self._record_question_source(question)
-        self.fill_cell("type", question.get_xls_type())
+        self._record_question_source(question, effective)
+        self.fill_cell("type", effective.get_xls_type())
         self.fill_cell("name", question.name)
-        self.fill_cell("constraint", question.constraint)
-        self.fill_cell("relevant", question.relevant)
-        self.fill_cell("choice_filter", question.choice_filter)
-        self.fill_cell("appearance", question.appearance)
-        self.fill_cell("default", question.default)
-        self.fill_cell("read_only", question.read_only)
-        self.fill_cell("required", question.required)
-        self.fill_cell("disabled", question.disabled)
-        self.fill_cell("calculation", question.calculation)
-        self.fill_cell("parameters", question.parameters)
+        self.fill_cell("constraint", effective.constraint)
+        self.fill_cell("relevant", effective.relevant)
+        self.fill_cell("choice_filter", effective.choice_filter)
+        self.fill_cell("appearance", effective.appearance)
+        self.fill_cell("default", effective.default)
+        self.fill_cell("read_only", effective.read_only)
+        self.fill_cell("required", effective.required)
+        self.fill_cell("disabled", effective.disabled)
+        self.fill_cell("calculation", effective.calculation)
+        self.fill_cell("parameters", effective.parameters)
 
         if self.languages:
             if "en" in self.language_values:
                 language = ("en", "English")
-                self.fill_cell("label", question.label, language=language)
-                self.fill_cell("hint", question.hint, language=language)
+                self.fill_cell("label", effective.label, language=language)
+                self.fill_cell("hint", effective.hint, language=language)
                 self.fill_cell(
-                    "constraint_message", question.constraint_message, language=language
+                    "constraint_message",
+                    effective.constraint_message,
+                    language=language,
                 )
 
-            for translation in question.translations.all():
+            for translation in effective.translations:
                 value = translation.language
                 language = (value, self.ENGLISH_LANGUAGES.get(value, value))
                 self.fill_cell("label", translation.label, language=language)
                 self.fill_cell("hint", translation.hint, language=language)
 
-            for translation in question.constraint_translations.all():
+            for translation in effective.constraint_translations:
                 value = translation.language
                 language = (value, self.ENGLISH_LANGUAGES.get(value, value))
                 self.fill_cell(
                     "constraint_message", translation.label, language=language
                 )
         else:
-            self.fill_cell("label", question.label)
-            self.fill_cell("hint", question.hint)
-            self.fill_cell("constraint_message", question.constraint_message)
+            self.fill_cell("label", effective.label)
+            self.fill_cell("hint", effective.hint)
+            self.fill_cell("constraint_message", effective.constraint_message)
 
-        if question.choices:
-            self.choices_ids.add(question.choices.id)
+        # Only internal choice lists go to the choices sheet; external files
+        # are tracked separately by _track_external_file().
+        if effective.choices is not None:
+            self.choices_ids.add(effective.choices.id)
+        return effective
 
-    def add_repeat_section(self, repeat_section):
+    def add_repeat_section(self, repeat_section, submodule):
         self.increment_row_index()
         self._record_row_source(repeat_section)
         self.fill_cell("type", "begin_repeat", bold=True)
@@ -537,7 +553,9 @@ class XLSForm:
                 & Q(sub_question__suffix_2__name="_oth")
             )
         ).order_by("order"):
-            self.add_question_row(base_question.instance)
+            question = base_question.instance
+            effective = self.add_question_row(question, submodule)
+            self._track_external_file(question, effective)
 
         self.increment_row_index()
         self.fill_cell("type", "end_repeat", bold=True)
@@ -702,9 +720,9 @@ class XLSForm:
         for question in base_questions:
             question_instance = question.instance
             if isinstance(question_instance, RepeatSection):
-                self.add_repeat_section(question_instance)
+                self.add_repeat_section(question_instance, submodule)
             else:
-                self.add_root_question(question_instance)
+                self.add_root_question(question_instance, submodule)
 
         self.increment_row_index()
         self.fill_cell("type", "end_group", bold=True)
@@ -732,17 +750,17 @@ class XLSForm:
         for question in base_questions:
             question_instance = question.instance
             if isinstance(question_instance, RepeatSection):
-                self.add_repeat_section(question_instance)
+                self.add_repeat_section(question_instance, submodule)
             else:
-                self.add_root_question(question_instance)
+                self.add_root_question(question_instance, submodule)
 
         self.increment_row_index()
         self.fill_cell("type", "end_group", bold=True)
 
-    def add_root_question(self, root_question):
+    def add_root_question(self, root_question, submodule):
         self.processed_questions.add(root_question.name)
-        self.add_question_row(root_question)
-        self._track_external_file(root_question)
+        effective = self.add_question_row(root_question, submodule)
+        self._track_external_file(root_question, effective)
 
         selected_suffixes = []
         for sub_question in root_question.sub_questions.order_by(
@@ -760,8 +778,8 @@ class XLSForm:
                 )
             ):
                 self.processed_questions.add(sub_question.name)
-                self.add_question_row(sub_question)
-                self._track_external_file(sub_question)
+                effective = self.add_question_row(sub_question, submodule)
+                self._track_external_file(sub_question, effective)
 
             if is_selected and suffix and suffix.name != "_oth":
                 selected_suffixes.append(sub_question.suffix)

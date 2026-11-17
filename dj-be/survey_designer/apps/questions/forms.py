@@ -6,6 +6,7 @@ from dal import autocomplete
 from django import forms
 from django.conf import settings
 from django.contrib.auth import get_permission_codename
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms import Form, ModelForm
 from django.forms.models import BaseInlineFormSet
 from modules.models import Indicator, Submodule
@@ -22,6 +23,7 @@ from questions.models import (
     ChoiceGroupFile,
     RepeatSection,
     RootQuestion,
+    SubmoduleQuestionConfig,
     SubQuestion,
     Suffix,
 )
@@ -46,17 +48,23 @@ class ExpressionValidationFormMixin:
     def get_expression_name(self):
         return self.cleaned_data.get("name") or self.instance.name
 
+    def get_expression_owner(self):
+        return {
+            "model": self.expression_model,
+            "id": self.instance.pk,
+            "name": self.get_expression_name(),
+        }
+
+    def get_expression_previous_name(self):
+        return self.instance.name if self.instance.pk else None
+
     def validate_expressions(self, fields, **kwargs):
         # questions.services imports the bulk importer, which imports this module.
         from questions.services.expression_scope import validate_expression_fields
 
-        previous_name = self.instance.name if self.instance.pk else None
+        previous_name = self.get_expression_previous_name()
         issues = validate_expression_fields(
-            {
-                "model": self.expression_model,
-                "id": self.instance.pk,
-                "name": self.get_expression_name(),
-            },
+            self.get_expression_owner(),
             {
                 field_name: self.cleaned_data.get(field_name, "")
                 for field_name in fields
@@ -351,6 +359,118 @@ class RootQuestionAdminModelForm(ExpressionValidationFormMixin, ModelForm):
             ],
         )
         return self.cleaned_data
+
+
+class ModelErrorsAsFormErrorsMixin:
+    """Show model ``clean()`` errors on fields the form does not render as
+    non-field errors instead of raising ``ValueError`` (a 500 in the admin)."""
+
+    def _update_errors(self, errors):
+        if hasattr(errors, "error_dict"):
+            remapped = {}
+            for field, messages in errors.error_dict.items():
+                if field != NON_FIELD_ERRORS and field not in self.fields:
+                    remapped.setdefault(NON_FIELD_ERRORS, []).extend(messages)
+                else:
+                    remapped.setdefault(field, []).extend(messages)
+            errors = ValidationError(remapped)
+        super()._update_errors(errors)
+
+
+class SubmoduleQuestionConfigAddForm(ModelErrorsAsFormErrorsMixin, ModelForm):
+    """First step of a submodule configuration: pick submodule + question.
+
+    The admin then creates a full copy with
+    ``SubmoduleQuestionConfig.create_from_question``. The form validates that
+    copy (membership, choice rules, uniqueness) so problems are form errors.
+    """
+
+    class Meta:
+        model = SubmoduleQuestionConfig
+        fields = ("submodule", "base_question")
+
+    def _get_validation_exclusions(self):
+        # Validate every model field of the copy, not only the two rendered
+        # ones; keep excluding rendered fields that already failed.
+        exclude = super()._get_validation_exclusions()
+        return {field for field in exclude if field in self.fields}
+
+    def clean(self):
+        cleaned_data = super().clean()
+        base_question = cleaned_data.get("base_question")
+        question = None
+        if base_question is not None:
+            question = base_question.root_question or base_question.sub_question
+        if question is not None:
+            self.instance.fill_from_question(question)
+        return cleaned_data
+
+
+class SubmoduleQuestionConfigAdminModelForm(
+    ModelErrorsAsFormErrorsMixin, ExpressionValidationFormMixin, ModelForm
+):
+    """Change form: same validation as the shared question it customises."""
+
+    class Meta:
+        model = SubmoduleQuestionConfig
+        exclude = ("created_by", "updated_by")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for field_name in ("choices", "choices_file"):
+            field = self.fields.get(field_name)
+            if field is not None and hasattr(field, "queryset"):
+                field.queryset = field.queryset.order_by("name")
+
+        question_type = self.instance.type if self.instance.base_question_id else ""
+        choices_field = self.fields.get("choices")
+        choices_file_field = self.fields.get("choices_file")
+        if choices_field is not None:
+            choices_field.required = question_type in (
+                QuestionType.SELECT_ONE,
+                QuestionType.SELECT_MULTIPLE,
+            )
+        if choices_file_field is not None:
+            choices_file_field.required = question_type in (
+                QuestionType.SELECT_ONE_FROM_FILE,
+                QuestionType.SELECT_MULTIPLE_FROM_FILE,
+            )
+
+    @property
+    def shared_question(self):
+        if not self.instance.base_question_id:
+            return None
+        return self.instance.question
+
+    def get_expression_owner(self):
+        # Lint as the shared question, so self-references and repeat scope
+        # resolve exactly as they do for it.
+        question = self.shared_question
+        return {
+            "model": type(question).__name__,
+            "id": question.pk,
+            "name": question.name,
+        }
+
+    def get_expression_previous_name(self):
+        # Name is not overridable, so a config never renames its question.
+        return None
+
+    def clean(self):
+        from questions.services.expression_validation import QUESTION_EXPRESSION_FIELDS
+
+        cleaned_data = super().clean()
+        question = self.shared_question
+        if question is None:
+            return cleaned_data
+        self.validate_expressions(
+            QUESTION_EXPRESSION_FIELDS,
+            question_type=question.type,
+            repeats=RepeatSection.objects.filter(
+                questions=self.instance.base_question_id
+            ).values_list("name", flat=True),
+        )
+        return cleaned_data
 
 
 class NestedSuffixForm(ModelForm):

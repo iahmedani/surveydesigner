@@ -1,8 +1,9 @@
 """Bounded, read-only survey health checks for the admin UI.
 
 The health page deliberately uses the same model expression validator as the
-authoring forms.  It only reads the four model types that contain expressions;
-it does not compose a survey or generate an XForm.
+authoring forms.  It only reads the model types that contain expressions
+(including per-submodule question configurations); it does not compose a
+survey or generate an XForm.
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ from typing import Any
 from django.db import DatabaseError, connection, transaction
 from django.db.models import F, Q
 from django.db.models.functions import Substr
-from questions.models import Calculation, RepeatSection, RootQuestion, SubQuestion
+from questions.models import (
+    Calculation,
+    RepeatSection,
+    RootQuestion,
+    SubmoduleQuestionConfig,
+    SubQuestion,
+)
 
 from .expression_scope import (
     GENERATED_METADATA_NAMES,
@@ -113,6 +120,13 @@ MODEL_SPECS = {
             "repeat_section", "Repeat section", RepeatSection, REPEAT_EXPRESSION_FIELDS
         ),
         HealthModelSpec("calculation", "Calculation", Calculation, ("calculation",)),
+        # Linted exactly like the shared question it customises.
+        HealthModelSpec(
+            "submodule_question_config",
+            "Submodule question configuration",
+            SubmoduleQuestionConfig,
+            QUESTION_EXPRESSION_FIELDS,
+        ),
     )
 }
 MODEL_ORDER = tuple(MODEL_SPECS)
@@ -231,7 +245,56 @@ def _objects_queryset(spec: HealthModelSpec, after_pk: int, limit: int):
         )
     elif spec.key in {"repeat_section", "calculation"}:
         queryset = queryset.only("id", "name", "is_active")
+    elif spec.key == "submodule_question_config":
+        queryset = queryset.select_related(
+            "submodule",
+            "base_question__root_question__base_question",
+            "base_question__sub_question__root_question__base_question",
+            "base_question__sub_question__suffix",
+            "base_question__sub_question__suffix_2",
+        ).only(
+            "id",
+            "submodule__id",
+            "submodule__name",
+            "base_question__id",
+            "base_question__root_question__id",
+            "base_question__root_question__name",
+            "base_question__root_question__is_active",
+            "base_question__root_question__type",
+            "base_question__root_question__base_question__id",
+            "base_question__sub_question__id",
+            "base_question__sub_question__name",
+            "base_question__sub_question__is_active",
+            "base_question__sub_question__root_question__id",
+            "base_question__sub_question__root_question__type",
+            "base_question__sub_question__root_question__base_question__id",
+            "base_question__sub_question__suffix__id",
+            "base_question__sub_question__suffix__type",
+            "base_question__sub_question__suffix_2__id",
+            "base_question__sub_question__suffix_2__type",
+        )
     return list(queryset[:limit])
+
+
+def _config_question(obj):
+    base_question = obj.base_question
+    return base_question.root_question or base_question.sub_question
+
+
+def _object_question_type(spec: HealthModelSpec, obj: Any) -> str:
+    if spec.key in {"root_question", "sub_question"}:
+        return getattr(obj, "type", "") or ""
+    if spec.key == "submodule_question_config":
+        question = _config_question(obj)
+        return (question.type or "") if question is not None else ""
+    return ""
+
+
+def _object_is_active(spec: HealthModelSpec, obj: Any) -> bool:
+    if spec.key == "submodule_question_config":
+        question = _config_question(obj)
+        return bool(getattr(question, "is_active", True))
+    return bool(getattr(obj, "is_active", True))
 
 
 def _repeat_names(relation, owner):
@@ -248,6 +311,36 @@ def _repeat_names(relation, owner):
 def _owner_data(
     spec: HealthModelSpec, obj: Any
 ) -> tuple[dict[str, Any], dict[str, str], set[str], set[str]]:
+    values = {
+        field: getattr(obj, f"_health_{field}") or ""
+        for field in spec.expression_fields
+    }
+    if spec.key == "submodule_question_config":
+        question = _config_question(obj)
+        # The owner name is the question name: it is the name the config's
+        # expressions are emitted under, so self references and cycles resolve.
+        owner = {
+            "model": spec.model.__name__,
+            "model_key": spec.key,
+            "model_label": spec.label,
+            "id": obj.pk,
+            "name": question.name if question is not None else "",
+            "is_active": _object_is_active(spec, obj),
+            "submodule": obj.submodule.name,
+            "config": {
+                "model": spec.model.__name__,
+                "id": obj.pk,
+                "submodule": {"id": obj.submodule.id, "name": obj.submodule.name},
+            },
+        }
+        if question is None:
+            return owner, values, set(), set()
+        base_question = (
+            question.base_question
+            if isinstance(question, RootQuestion)
+            else question.root_question.base_question
+        )
+        return owner, values, _repeat_names(base_question.repeat_sections, owner), set()
     owner = {
         "model": spec.model.__name__,
         "model_key": spec.key,
@@ -255,10 +348,6 @@ def _owner_data(
         "id": obj.pk,
         "name": obj.name,
         "is_active": bool(getattr(obj, "is_active", True)),
-    }
-    values = {
-        field: getattr(obj, f"_health_{field}") or ""
-        for field in spec.expression_fields
     }
     if spec.key in {"root_question", "sub_question"}:
         # The SubQuestion admin form submits the root question's repeat
@@ -491,13 +580,18 @@ def _scan_error(
 
 
 def _owner_payload(owner: dict[str, Any] | None) -> dict[str, Any]:
-    return {
+    payload = {
         "model": owner.get("model_key") if owner else None,
         "model_label": owner.get("model_label") if owner else None,
         "id": owner.get("id") if owner else None,
         "name": owner.get("name") if owner else None,
         "is_active": owner.get("is_active") if owner else None,
     }
+    if owner and owner.get("submodule"):
+        # Submodule configurations share the question name; the submodule
+        # tells content managers which configuration a finding belongs to.
+        payload["submodule"] = owner["submodule"]
+    return payload
 
 
 def _issue_payload(
@@ -633,11 +727,7 @@ def scan_batch(
                         validation_issues = validate_expression_fields(
                             owner,
                             values,
-                            question_type=(
-                                (getattr(obj, "type", "") or "")
-                                if spec.key in {"root_question", "sub_question"}
-                                else ""
-                            ),
+                            question_type=_object_question_type(spec, obj),
                             repeats=repeats,
                             members=members,
                             scope=scope,
@@ -731,7 +821,7 @@ def scan_batch(
                         {
                             "id": owner["id"],
                             "name": owner["name"],
-                            "is_active": bool(getattr(obj, "is_active", True)),
+                            "is_active": _object_is_active(spec, obj),
                         }
                         for obj, owner, _values, _repeats, _members in records
                     ],

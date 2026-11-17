@@ -1,6 +1,7 @@
 from typing import Dict, List
 
 from django.conf import settings
+from drf_spectacular.utils import extend_schema_field
 from modules.models import (
     Indicator,
     IndicatorArea,
@@ -9,7 +10,12 @@ from modules.models import (
     SubmoduleRequiredGroup,
 )
 from organization.serializers import OrganizationSerializer
-from questions.serializers import RootQuestionSerializer
+from questions.serializers import (
+    QUESTION_CONFIG_RESOLVER_CONTEXT,
+    QUESTION_CONFIG_SUBMODULE_CONTEXT,
+    RootQuestionSerializer,
+)
+from questions.services.question_config import QuestionConfigResolver
 from rest_framework import serializers
 from surveys.serializers import SurveyTypesSerializer
 
@@ -58,9 +64,15 @@ class SubmoduleRequiredGroupSerializer(serializers.ModelSerializer):
 
 
 class SubmoduleWithQuestionsSerializer(serializers.ModelSerializer):
-    root_questions = RootQuestionSerializer(
-        source="filtered_root_questions", many=True, read_only=True
-    )
+    """Submodule with its questions as configured *for this submodule*.
+
+    Labels, choices/choices_file and translations are the effective values
+    (SubmoduleQuestionConfig, see questions/services/question_config.py). The
+    view passes one bulk-loaded resolver in the context; without it the
+    serializer loads the configs of the serialized submodule itself.
+    """
+
+    root_questions = serializers.SerializerMethodField()
     repeat_section_translations = serializers.SerializerMethodField()
     required_groups = SubmoduleRequiredGroupSerializer(many=True, read_only=True)
 
@@ -75,6 +87,24 @@ class SubmoduleWithQuestionsSerializer(serializers.ModelSerializer):
             "repeat_section_translations",
             "is_active",
         )
+
+    def _config_resolver(self, obj):
+        resolver = self.context.get(QUESTION_CONFIG_RESOLVER_CONTEXT)
+        if resolver is None or obj.id not in resolver.submodule_ids:
+            resolver = QuestionConfigResolver([obj.id], prefetch_choice_options=True)
+        return resolver
+
+    @extend_schema_field(RootQuestionSerializer(many=True, read_only=True))
+    def get_root_questions(self, obj):
+        questions = getattr(obj, "filtered_root_questions", None)
+        if questions is None:
+            questions = obj.root_questions.all()
+        context = {
+            **self.context,
+            QUESTION_CONFIG_RESOLVER_CONTEXT: self._config_resolver(obj),
+            QUESTION_CONFIG_SUBMODULE_CONTEXT: obj.id,
+        }
+        return RootQuestionSerializer(questions, many=True, context=context).data
 
     def get_repeat_section_translations(self, obj) -> List[Dict[str, str]]:
         language_codes = set()
