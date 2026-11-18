@@ -5,6 +5,10 @@ from questions.services.questions_import.choices import ChoicesImport
 from questions.services.questions_import.indicators import IndicatorsImport
 from questions.services.questions_import.questions import QuestionsImport
 from questions.services.questions_import.recall_period import RecallPeriodImport
+from questions.services.questions_import.submodule_question_configs import (
+    SHEET_NAME as SUBMODULE_QUESTION_CONFIGS_SHEET,
+    SubmoduleQuestionConfigImport,
+)
 from questions.services.questions_import.submodule_required_group import (
     SubmoduleRequiredGroupImport,
 )
@@ -33,6 +37,12 @@ class DataImport:
         self.recall_periods_sheet = self.wb["recall_periods"]
         self.required_groups_sheet = self.wb["required_groups"]
         self.indicators_sheet = self.wb["indicators"]
+        # Optional: templates exported before per-submodule configs lack it.
+        self.submodule_question_configs_sheet = (
+            self.wb[SUBMODULE_QUESTION_CONFIGS_SHEET]
+            if SUBMODULE_QUESTION_CONFIGS_SHEET in self.wb.sheetnames
+            else None
+        )
 
         self.recall_periods_import = RecallPeriodImport(
             self.recall_periods_sheet,
@@ -66,6 +76,13 @@ class DataImport:
             user,
             change_request=self.change_request,
         )
+        self.submodule_question_configs_import = SubmoduleQuestionConfigImport(
+            self.submodule_question_configs_sheet,
+            self.languages_dict,
+            user,
+            organizations,
+            change_request=self.change_request,
+        )
 
     def process(self):
         self.recall_periods_import.process()
@@ -82,6 +99,10 @@ class DataImport:
         processed_questions = self.questions_import.get_processed_names()
         self.required_groups_import.process()
         self.indicators_import.process(processed_questions)
+        self.submodule_question_configs_import.process(
+            available_spreadsheet_choices=processed_choice_names,
+            available_spreadsheet_names=processed_questions,
+        )
 
     def is_valid(self):
         return (
@@ -91,6 +112,7 @@ class DataImport:
             and self.questions_import.is_valid()
             and self.required_groups_import.is_valid()
             and self.indicators_import.is_valid()
+            and self.submodule_question_configs_import.is_valid()
         )
 
     @property
@@ -139,6 +161,13 @@ class DataImport:
             errors["Indicators Spreadsheet"] = {
                 "errors": self.indicators_import.errors,
                 "non_form_errors": self.indicators_import.non_form_errors,
+            }
+
+        configs_import = self.submodule_question_configs_import
+        if configs_import.errors or configs_import.non_form_errors:
+            errors["Submodule Question Configurations Spreadsheet"] = {
+                "errors": configs_import.errors,
+                "non_form_errors": configs_import.non_form_errors,
             }
 
         return errors
@@ -190,6 +219,13 @@ class DataImport:
                 to_update_key: dict(self.indicators_import.to_be_updated),
             }
 
+        configs_import = self.submodule_question_configs_import
+        if configs_import.to_be_created or configs_import.to_be_updated:
+            updates["Submodule Question Configurations Spreadsheet"] = {
+                to_create_key: dict(configs_import.to_be_created),
+                to_update_key: dict(configs_import.to_be_updated),
+            }
+
         return updates
 
     def create(self, skip_saving=False):
@@ -201,6 +237,10 @@ class DataImport:
         )
         created_groups = self.required_groups_import.create(skip_saving)
         created_indicators = self.indicators_import.create(skip_saving)
+        # After questions/choices exist; the return tuple is kept for callers.
+        self.created_submodule_question_configs = (
+            self.submodule_question_configs_import.create(created_choices, skip_saving)
+        )
         return (
             created,
             created_choices,

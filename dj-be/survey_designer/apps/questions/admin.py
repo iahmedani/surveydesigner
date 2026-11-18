@@ -14,7 +14,7 @@ from core.utils import get_model_admin_base_url
 from django.contrib import admin, messages
 from django.contrib.admin.options import IS_POPUP_VAR
 from django.contrib.postgres.aggregates import ArrayAgg
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import models
 from django.db.models import Count, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Coalesce
@@ -32,6 +32,7 @@ from organization.mixins import (
     OrganizationOwnedParentFieldMixin,
     RequestUserFormMixin,
 )
+from organization.permissions import can_mutate_object
 from questions.admin_filters import (
     ChoiceListFilter,
     ParentSuffixListFilter,
@@ -56,6 +57,8 @@ from questions.forms import (
     NestedSuffixForm,
     RepeatSectionAdminModelForm,
     RootQuestionAdminModelForm,
+    SubmoduleQuestionConfigAddForm,
+    SubmoduleQuestionConfigAdminModelForm,
     SubQuestionAdminModelForm,
     SubQuestionProxyForm,
     SubQuestionProxyTranslationFormset,
@@ -75,6 +78,9 @@ from questions.models import (
     RootQuestion,
     RootQuestionConstraintMessageTranslation,
     RootQuestionTranslation,
+    SubmoduleQuestionConfig,
+    SubmoduleQuestionConfigConstraintMessageTranslation,
+    SubmoduleQuestionConfigTranslation,
     SubQuestion,
     SubQuestionConstraintMessageTranslation,
     SubQuestionProxy,
@@ -477,11 +483,24 @@ class RootQuestionAdmin(
                 )
             },
         ),
+        (
+            "Submodule configurations",
+            {"fields": ("submodule_configurations",)},
+        ),
     )
+    readonly_fields = ("submodule_configurations",)
 
     class Media:
         css = {"all": (static("js/tribute/tribute.css"),)}
         js = [static("js/tribute/tribute.js"), static("js/admin/question.js")]
+
+    @admin.display(description="Customize per submodule")
+    def submodule_configurations(self, obj):
+        if obj is None or not obj.pk:
+            return "-"
+        return submodule_configurations_display(
+            obj, obj.submodule.select_related("module")
+        )
 
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
@@ -800,6 +819,15 @@ class SubQuestionAdmin(
     # list_filter = (RootQuestionListFilter,)
     list_filter = (RecallPeriodListFilter,)
     search_fields = ("name", "label", "description")
+    readonly_fields = ("submodule_configurations",)
+
+    @admin.display(description="Customize per submodule")
+    def submodule_configurations(self, obj):
+        if obj is None or not obj.pk:
+            return "-"
+        return submodule_configurations_display(
+            obj, obj.root_question.submodule.select_related("module")
+        )
 
     class Media:
         css = {"all": (static("js/tribute/tribute.css"),)}
@@ -1141,6 +1169,10 @@ class BaseQuestionAdmin(
         if types:
             types = types.split(",")
             queryset = queryset.filter_by_types(types, annotate_type=True)
+
+        if request.GET.get("model_name") == SubmoduleQuestionConfig._meta.model_name:
+            # Per-submodule configurations exist for root/sub questions only.
+            queryset = queryset.filter(repeat_section__isnull=True)
 
         return queryset, use_distinct
 
@@ -1661,4 +1693,249 @@ class RepeatSectionAdmin(
                 (get_model_admin_base_url(Submodule, "_change", [s.id]), s.label)
                 for s in submodules
             ),
+        )
+
+
+def submodule_configurations_display(question, submodules):
+    """Links to edit or create per-submodule configurations of ``question``."""
+    if question is None or not question.pk:
+        return "-"
+    base_question = question.base_question
+    configs = {
+        config.submodule_id: config
+        for config in base_question.submodule_configs.only("id", "submodule_id")
+    }
+    add_url = get_model_admin_base_url(SubmoduleQuestionConfig, "_add")
+    rows = []
+    for submodule in submodules:
+        config = configs.get(submodule.id)
+        if config is not None:
+            url = get_model_admin_base_url(
+                SubmoduleQuestionConfig, "_change", [config.id]
+            )
+            action = "Edit configuration"
+        else:
+            url = f"{add_url}?submodule={submodule.id}&base_question={base_question.id}"
+            action = "Customize for this submodule"
+        rows.append((url, action, str(submodule)))
+    if not rows:
+        return "-"
+    return format_html(
+        "<ul>{}</ul>",
+        format_html_join("", "<li><a href='{}'>{}</a>: {}</li>", rows),
+    )
+
+
+class SubmoduleQuestionConfigTranslationInline(
+    ObjectPermissionMixin,
+    FormFieldOverridesMixin,
+    admin.TabularInline,
+):
+    model = SubmoduleQuestionConfigTranslation
+    extra = 0
+    exclude = ("created_by", "updated_by")
+    form = TranslationForm
+
+
+class SubmoduleQuestionConfigConstraintMessageTranslationInline(
+    ObjectPermissionMixin,
+    FormFieldOverridesMixin,
+    admin.TabularInline,
+):
+    model = SubmoduleQuestionConfigConstraintMessageTranslation
+    extra = 0
+    exclude = ("created_by", "updated_by")
+    form = TranslationForm
+    verbose_name = "Constraint message translation"
+    verbose_name_plural = "Constraint message translations"
+
+
+@admin.register(SubmoduleQuestionConfig)
+class SubmoduleQuestionConfigAdmin(
+    CollationSafeSearchAdminMixin,
+    OrganizationOwnedParentFieldMixin,
+    ObjectPermissionMixin,
+    ChangeFormOrganizationsDisplayMixin,
+    RequestUserFormMixin,
+    AdminUserTrackingMixin,
+    FormFieldOverridesMixin,
+    admin.ModelAdmin,
+):
+    """Per-submodule copy of a shared root or sub-question.
+
+    The add view only asks for the submodule and question, then creates a
+    full copy (``SubmoduleQuestionConfig.create_from_question``) and opens the
+    change view, where everything except name and type can be edited.
+    """
+
+    organization_owned_parent_fields = ["submodule"]
+    form = SubmoduleQuestionConfigAdminModelForm
+    add_form = SubmoduleQuestionConfigAddForm
+    autocomplete_fields = ("submodule", "base_question", "choices", "choices_file")
+    list_display = (
+        "question_name_display",
+        "submodule",
+        "type_display",
+        "modified_by",
+        "modified_on",
+    )
+    list_filter = (("submodule", admin.RelatedOnlyFieldListFilter),)
+    list_select_related = (
+        "submodule__module",
+        "base_question__root_question",
+        "base_question__sub_question__root_question",
+        "base_question__sub_question__suffix",
+        "base_question__sub_question__suffix_2",
+        "updated_by",
+    )
+    search_fields = (
+        "base_question__root_question__name",
+        "base_question__sub_question__name",
+        "submodule__name",
+        "submodule__label",
+    )
+    add_fieldsets = ((None, {"fields": ("submodule", "base_question")}),)
+    change_readonly_fields = ("submodule_link", "question_link", "type_display")
+    fieldsets = (
+        (None, {"fields": change_readonly_fields}),
+        (
+            "Configuration (copied from the shared question)",
+            {
+                "fields": (
+                    "label",
+                    "hint",
+                    "choices",
+                    "choices_file",
+                    "relevant",
+                    "constraint",
+                    "constraint_message",
+                    "appearance",
+                    "required",
+                    "disabled",
+                    "read_only",
+                    "default",
+                    "choice_filter",
+                    "calculation",
+                    "parameters",
+                )
+            },
+        ),
+    )
+    change_inlines = (
+        SubmoduleQuestionConfigConstraintMessageTranslationInline,
+        SubmoduleQuestionConfigTranslationInline,
+    )
+
+    def get_queryset(self, request):
+        return (
+            super()
+            .get_queryset(request)
+            .select_related(*self.list_select_related)
+            .annotate(
+                annotated_question_name=Coalesce(
+                    "base_question__root_question__name",
+                    "base_question__sub_question__name",
+                )
+            )
+        )
+
+    def has_view_permission(self, request, obj=None):
+        # Configurations are part of their submodule.
+        return super().has_view_permission(request, obj) and (
+            request.user.has_perm("modules.view_submodule")
+            or request.user.has_perm("modules.change_submodule")
+        )
+
+    def get_fieldsets(self, request, obj=None):
+        if obj is None:
+            return self.add_fieldsets
+        return super().get_fieldsets(request, obj)
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return ()
+        return (
+            *self.change_readonly_fields,
+            *super().get_readonly_fields(request, obj),
+        )
+
+    def get_inlines(self, request, obj):
+        if obj is None:
+            return ()
+        return self.change_inlines
+
+    def get_form(self, request, obj=None, change=False, **kwargs):
+        if obj is None:
+            kwargs["form"] = self.add_form
+        return super().get_form(request, obj, change, **kwargs)
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == "base_question":
+            kwargs["queryset"] = BaseQuestion.objects.filter(
+                repeat_section__isnull=True
+            ).select_related("root_question", "sub_question")
+        elif db_field.name == "submodule":
+            kwargs["queryset"] = Submodule.objects.select_related("module")
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def save_form(self, request, form, change):
+        if change:
+            return super().save_form(request, form, change)
+        submodule = form.cleaned_data["submodule"]
+        if not can_mutate_object(request.user, submodule):
+            raise PermissionDenied
+        return SubmoduleQuestionConfig.create_from_question(
+            submodule, form.cleaned_data["base_question"], user=request.user
+        )
+
+    def save_model(self, request, obj, form, change):
+        if not change:
+            # Created, with user tracking, by save_form().
+            return
+        super().save_model(request, obj, form, change)
+
+    def save_related(self, request, form, formsets, change):
+        if not change:
+            # The add form has no inlines; translations were copied.
+            return
+        super().save_related(request, form, formsets, change)
+
+    def response_add(self, request, obj, post_url_continue=None):
+        if IS_POPUP_VAR in request.POST:
+            return super().response_add(request, obj, post_url_continue)
+        self.message_user(
+            request,
+            f"Created a configuration of '{obj.question_name}' for "
+            f"'{obj.submodule}' by copying the shared question. Edit it below.",
+            messages.SUCCESS,
+        )
+        return HttpResponseRedirect(
+            get_model_admin_base_url(SubmoduleQuestionConfig, "_change", [obj.pk])
+        )
+
+    @admin.display(description="Question", ordering="annotated_question_name")
+    def question_name_display(self, obj):
+        return obj.question_name
+
+    @admin.display(description="Type")
+    def type_display(self, obj):
+        return obj.type
+
+    @admin.display(description="Submodule")
+    def submodule_link(self, obj):
+        return format_html(
+            "<a href='{}'>{}</a>",
+            get_model_admin_base_url(Submodule, "_change", [obj.submodule_id]),
+            str(obj.submodule),
+        )
+
+    @admin.display(description="Shared question")
+    def question_link(self, obj):
+        question = obj.question
+        if question is None:
+            return "-"
+        return format_html(
+            "<a href='{}'>{}</a>",
+            get_model_admin_base_url(type(question), "_change", [question.pk]),
+            question.name,
         )

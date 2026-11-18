@@ -15,6 +15,9 @@ from questions.models import (
     ChoiceGroupFile,
     RepeatSection,
     RootQuestion,
+    SubmoduleQuestionConfig,
+    SubmoduleQuestionConfigConstraintMessageTranslation,
+    SubmoduleQuestionConfigTranslation,
     SubQuestion,
     Suffix,
 )
@@ -50,6 +53,25 @@ def get_organizations(obj) -> QuerySet:
     if isinstance(obj, Submodule):
         return obj.module.organizations.all()
 
+    if isinstance(obj, SubmoduleQuestionConfig):
+        # A submodule's question configuration belongs to the submodule.
+        if not obj.submodule_id:
+            return Organization.objects.none()
+        return Organization.objects.filter(module__submodules=obj.submodule_id)
+
+    if isinstance(
+        obj,
+        (
+            SubmoduleQuestionConfigTranslation,
+            SubmoduleQuestionConfigConstraintMessageTranslation,
+        ),
+    ):
+        if not obj.config_id:
+            return Organization.objects.none()
+        return Organization.objects.filter(
+            module__submodules__question_configs=obj.config_id
+        )
+
     if isinstance(obj, SubmoduleMapping):
         return Organization.objects.filter(
             Q(module__default_submodule_mapping=obj)
@@ -65,7 +87,10 @@ def get_organizations(obj) -> QuerySet:
         q1 = Q(module__submodules__root_questions__choices=obj)
         q2 = Q(module__submodules__root_questions__sub_questions__suffix__choices=obj)
         q3 = Q(module__submodules__root_questions__sub_questions__suffix_2__choices=obj)
-        return Organization.objects.filter(q1 | q2 | q3).distinct()
+        # Lists used by a per-submodule configuration are emitted by that
+        # submodule's surveys, so its organizations share ownership.
+        q4 = Q(module__submodules__question_configs__choices=obj)
+        return Organization.objects.filter(q1 | q2 | q3 | q4).distinct()
 
     if isinstance(obj, ChoiceGroupFile):
         q1 = Q(module__submodules__root_questions__choices_file=obj)
@@ -75,7 +100,8 @@ def get_organizations(obj) -> QuerySet:
         q3 = Q(
             module__submodules__root_questions__sub_questions__suffix_2__choices_file=obj
         )
-        return Organization.objects.filter(q1 | q2 | q3).distinct()
+        q4 = Q(module__submodules__question_configs__choices_file=obj)
+        return Organization.objects.filter(q1 | q2 | q3 | q4).distinct()
 
     if isinstance(obj, Calculation):
         q = Q(module__submodules__root_questions__calculation=obj)

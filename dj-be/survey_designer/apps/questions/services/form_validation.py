@@ -256,6 +256,37 @@ class ValidationResult:
     to_dict = as_dict
 
 
+def owner_config_note(owner: Mapping[str, Any] | None) -> str:
+    """Message suffix naming the submodule configuration that owns a row.
+
+    Rows emitted from a ``SubmoduleQuestionConfig`` carry a ``config`` entry
+    in their owner; the content manager must edit that configuration, not the
+    shared question, so the message says so.
+    """
+
+    config = (owner or {}).get("config") if isinstance(owner, Mapping) else None
+    if not config:
+        return ""
+    submodule = config.get("submodule") or {}
+    submodule_name = submodule.get("name") or ""
+    return (
+        f" The value comes from the submodule-specific configuration in "
+        f"submodule '{submodule_name}' (SubmoduleQuestionConfig #{config.get('id')}); "
+        "edit that configuration to fix it."
+    )
+
+
+def _owner_from_source(source: Mapping[str, Any]) -> dict[str, Any]:
+    owner = {
+        key: source[key]
+        for key in ("model", "id", "name")
+        if source.get(key) is not None
+    }
+    if source.get("config"):
+        owner["config"] = source["config"]
+    return owner
+
+
 def _issue(
     code: str,
     layer: str,
@@ -264,11 +295,15 @@ def _issue(
     severity: str = "error",
     **details: Any,
 ) -> ValidationIssue:
+    message = str(message)
+    note = owner_config_note(details.get("owner"))
+    if note and note not in message:
+        message = f"{message}{note}"
     return ValidationIssue(
         code=code,
         layer=layer,
         severity=severity,
-        message=str(message),
+        message=message,
         **{key: value for key, value in details.items() if value is not None},
     )
 
@@ -1033,11 +1068,7 @@ def _survey_row_owner(
     source = _source_for_survey_row(row_source_map, row_number)
     if not source:
         return _generated_survey_owner(row_type, name)
-    return {
-        key: source[key]
-        for key in ("model", "id", "name")
-        if source.get(key) is not None
-    }
+    return _owner_from_source(source)
 
 
 def expression_question_references(expression: str) -> set[str]:
@@ -2006,11 +2037,7 @@ def _row_owner(
     source = _source_for_row(row_source_map, sheet, row_number)
     if not source:
         return dict(fallback)
-    return {
-        key: source[key]
-        for key in ("model", "id", "name")
-        if source.get(key) is not None
-    }
+    return _owner_from_source(source)
 
 
 def _validate_final_source_context(
@@ -2024,11 +2051,7 @@ def _validate_final_source_context(
         if not source or source.get("model") != "SubQuestion":
             continue
 
-        owner = {
-            key: source[key]
-            for key in ("model", "id", "name")
-            if source.get(key) is not None
-        }
+        owner = _owner_from_source(source)
         suffix_1 = source.get("suffix")
         suffix_2 = source.get("suffix_2")
         recall_period = source.get("recall_period")

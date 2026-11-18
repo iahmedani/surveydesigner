@@ -10,11 +10,17 @@ from questions.models import (
     RepeatSection,
     RootQuestion,
     RootQuestionTranslation,
+    SubmoduleQuestionConfigTranslation,
     SubQuestion,
     SubQuestionTranslation,
     Suffix,
 )
 from rest_framework import serializers
+
+# Serializer context keys used by /api/submodules/ to emit per-submodule
+# effective question values (see services/question_config.py).
+QUESTION_CONFIG_RESOLVER_CONTEXT = "question_config_resolver"
+QUESTION_CONFIG_SUBMODULE_CONTEXT = "question_config_submodule_id"
 
 
 class CalculationSerializer(serializers.ModelSerializer):
@@ -98,7 +104,50 @@ class SubQuestionTranslationSerializer(RootQuestionTranslationSerializer):
         fields = RootQuestionTranslationSerializer.Meta.fields
 
 
-class SubQuestionSerializer(serializers.ModelSerializer):
+class SubmoduleQuestionConfigTranslationSerializer(RootQuestionTranslationSerializer):
+    class Meta:
+        model = SubmoduleQuestionConfigTranslation
+        fields = RootQuestionTranslationSerializer.Meta.fields
+
+
+class EffectiveQuestionSerializerMixin:
+    """Replace shared values by the submodule's effective configuration.
+
+    Active only when the serializer context carries a QuestionConfigResolver
+    and the submodule being serialized; the JSON shape never changes.
+    """
+
+    def _effective(self, instance):
+        resolver = self.context.get(QUESTION_CONFIG_RESOLVER_CONTEXT)
+        submodule_id = self.context.get(QUESTION_CONFIG_SUBMODULE_CONTEXT)
+        if not resolver or submodule_id is None:
+            return None
+        effective = resolver.resolve(instance, submodule_id)
+        return effective if effective.is_customised else None
+
+    def apply_effective(self, data, effective, *, include_choices_file):
+        if effective.config is not None:
+            data["label"] = effective.label
+            data["translations"] = SubmoduleQuestionConfigTranslationSerializer(
+                effective.translations, many=True
+            ).data
+        choices = effective.choices
+        data["choices"] = (
+            ChoiceGroupSerializer(choices).data if choices is not None else None
+        )
+        if include_choices_file:
+            choices_file = effective.choices_file
+            data["choices_file"] = (
+                ChoiceGroupFileSerializer(choices_file, context=self.context).data
+                if choices_file is not None
+                else None
+            )
+        return data
+
+
+class SubQuestionSerializer(
+    EffectiveQuestionSerializerMixin, serializers.ModelSerializer
+):
     suffix = SuffixSerializer(required=False)
     suffix_2 = SuffixSerializer(required=False)
     recall_period = RecallPeriodSerializer(required=False)
@@ -151,8 +200,17 @@ class SubQuestionSerializer(serializers.ModelSerializer):
 
         return group
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        effective = self._effective(instance)
+        if effective is None:
+            return data
+        return self.apply_effective(data, effective, include_choices_file=False)
 
-class RootQuestionSerializer(serializers.ModelSerializer):
+
+class RootQuestionSerializer(
+    EffectiveQuestionSerializerMixin, serializers.ModelSerializer
+):
     sub_questions = SubQuestionSerializer(many=True, read_only=True)
     translations = RootQuestionTranslationSerializer(many=True, read_only=True)
     choices = ChoiceGroupSerializer(read_only=True)
@@ -169,6 +227,13 @@ class RootQuestionSerializer(serializers.ModelSerializer):
             "sub_questions",
             "translations",
         )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        effective = self._effective(instance)
+        if effective is None:
+            return data
+        return self.apply_effective(data, effective, include_choices_file=True)
 
 
 class RootQuestionExportSerializer(serializers.ModelSerializer):

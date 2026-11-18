@@ -15,7 +15,7 @@ from django.forms import Textarea
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from django.templatetags.static import static
-from django.utils.html import format_html
+from django.utils.html import format_html, format_html_join
 from modules.admin_filters import (
     IndicatorSurveyModeFilter,
     IndicatorSurveyTypeFilter,
@@ -67,7 +67,7 @@ from organization.mixins import (
 )
 from organization.models import Organization
 from organization.permissions import mutable_objects_queryset
-from questions.models import BaseQuestion, RootQuestion
+from questions.models import BaseQuestion, RootQuestion, SubmoduleQuestionConfig
 from questions.services import QuestionsExport
 from surveys.models import SurveyAttribute, SurveyCategory, SurveyMode, SurveyType
 
@@ -299,7 +299,7 @@ class SubmoduleAdmin(
     list_select_related = ("module", "updated_by")
     search_fields = ("label", "name", "description")
     inlines = (SubmoduleRequiredGroupInline, SubmoduleTranslationInline)
-    readonly_fields = ("question_list_button",)
+    readonly_fields = ("question_list_button", "question_configs_display")
     dynamic_raw_id_fields = ("mapping",)
     actions = (
         "add_submodule_mapping",
@@ -309,7 +309,7 @@ class SubmoduleAdmin(
     fieldsets = (
         (
             "Related",
-            {"fields": ("question_list_button",)},
+            {"fields": ("question_list_button", "question_configs_display")},
         ),
         (
             "-",
@@ -359,6 +359,51 @@ class SubmoduleAdmin(
     @admin.display(description="Module")
     def module_display(self, obj):
         return obj.module.label
+
+    @admin.display(description="Question configurations")
+    def question_configs_display(self, obj):
+        if obj is None or not obj.pk:
+            return "-"
+        configs = obj.question_configs.select_related(
+            "base_question__root_question", "base_question__sub_question"
+        ).order_by("pk")
+        items = format_html_join(
+            "",
+            "<li><a href='{}'>{}</a></li>",
+            (
+                (
+                    get_model_admin_base_url(
+                        SubmoduleQuestionConfig, "_change", [config.pk]
+                    ),
+                    config.question_name,
+                )
+                for config in configs
+            ),
+        )
+        add_url = get_model_admin_base_url(SubmoduleQuestionConfig, "_add")
+        return format_html(
+            "<ul>{}</ul><a class='addlink' href='{}?submodule={}'>{}</a>",
+            items or format_html("<li>{}</li>", "None (all questions are shared)"),
+            add_url,
+            obj.pk,
+            "Add configuration",
+        )
+
+    def get_search_results(self, request, queryset, search_term):
+        queryset, use_distinct = super().get_search_results(
+            request, queryset, search_term
+        )
+        if (
+            request.GET.get("model_name") == SubmoduleQuestionConfig._meta.model_name
+            and request.GET.get("field_name") == "submodule"
+        ):
+            # Offer only submodules the user may add configurations to.
+            queryset = queryset.filter(
+                pk__in=mutable_objects_queryset(
+                    Submodule.objects.all(), request.user
+                ).values("pk")
+            )
+        return queryset, use_distinct
 
     @admin.display(description="Order")
     def order_display(self, obj):

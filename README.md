@@ -22,6 +22,12 @@ data collection & analysis (saving time and resources) as well as allowing for
 reproducibility and sharing resources between users. This tool is targeted for
 users that are using XLSForm or ODK-based tools (such as: MoDa or Kobo).
 
+## Developer documentation
+
+The engineering knowledge base (architecture, setup with or without Docker,
+backend/frontend guides, survey-generation pipeline, testing, feature playbook,
+production-readiness checklist) lives in [`docs/kb/`](docs/kb/README.md).
+
 ## Frontend Architecture
 
 The application's frontend is designed as a decoupled solution from the backend.

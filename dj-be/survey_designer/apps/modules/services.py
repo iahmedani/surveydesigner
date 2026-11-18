@@ -1,13 +1,21 @@
 from collections import defaultdict
 
-from django.db.models import Prefetch, Q
+from django.db.models import Exists, OuterRef, Prefetch, Q
 from modules.models import Indicator, Module, Submodule
-from questions.models import BaseQuestion, RepeatSection, RootQuestion, SubQuestion
+from questions.models import (
+    BaseQuestion,
+    RepeatSection,
+    RootQuestion,
+    SubmoduleQuestionConfig,
+    SubQuestion,
+)
 from questions.services.expression_validation import QUESTION_EXPRESSION_FIELDS
 from questions.services.form_validation import (
     ValidationIssue,
     expression_question_references,
+    owner_config_note,
 )
+from questions.services.question_config import QuestionConfigResolver, config_reference
 
 
 class SubmoduleCompositionValidator:
@@ -26,6 +34,8 @@ class SubmoduleCompositionValidator:
         self._scope_submodules = None
         self._indicator_questions = None
         self._owner_submodules = {}
+        self._config_resolver = None
+        self._expression_submodule_ids = {}
 
     def get_root_question_queryset(self):
         return RootQuestion.objects.select_related("base_question")
@@ -73,6 +83,13 @@ class SubmoduleCompositionValidator:
             }
             self._scope_submodules = list(
                 Submodule.objects.filter(id__in=scope_ids).select_related("module")
+                # Lets the config resolver skip its queries when nothing in
+                # scope is customised (the common case).
+                .annotate(
+                    _has_question_configs=Exists(
+                        SubmoduleQuestionConfig.objects.filter(submodule=OuterRef("pk"))
+                    )
+                )
             )
         return self._scope_submodules
 
@@ -299,7 +316,7 @@ class SubmoduleCompositionValidator:
     def _dependency_issue(
         self, owner, field, referenced_name, code, detail, dependency
     ):
-        owner_data = self._owner(owner)
+        owner_data = self._expression_owner(owner)
         return ValidationIssue(
             code=code,
             layer="composition",
@@ -307,6 +324,7 @@ class SubmoduleCompositionValidator:
             message=(
                 f"{owner_data['model']} '{owner.name}' field '{field}' references "
                 f"question '{referenced_name}', {detail}"
+                + owner_config_note(owner_data)
             ),
             owner=owner_data,
             submodule=self._affected_submodule(owner),
@@ -314,13 +332,104 @@ class SubmoduleCompositionValidator:
             field=field,
         )
 
+    def get_config_resolver(self):
+        if self._config_resolver is None:
+            self._config_resolver = QuestionConfigResolver(
+                submodule.id
+                for submodule in self.get_scope_submodules()
+                if getattr(submodule, "_has_question_configs", True)
+            )
+        return self._config_resolver
+
+    def _scope_submodule_rank(self, submodule_id):
+        if submodule_id in self.submodule_order:
+            return (0, self.submodule_order[submodule_id], submodule_id)
+        if submodule_id in self.all_submodule_ids:
+            return (1, self.all_submodule_ids.index(submodule_id), submodule_id)
+        return (2, 0, submodule_id)
+
+    def _set_expression_submodules(self, owners):
+        """Which submodule's configuration applies to each question owner.
+
+        Selected submodules come first (a survey cannot select two submodules
+        sharing a question, see SELECTED_SCOPE_SUBMODULE_CONFLICT); questions
+        pulled in by indicators use the in-scope submodule that emits them.
+        """
+
+        self._expression_submodule_ids = {}
+        if not self.get_config_resolver():
+            # Nothing in scope is customised: shared expressions apply.
+            return
+        scope_ids = {submodule.id for submodule in self.get_scope_submodules()}
+        unresolved_roots = defaultdict(list)
+        for owner in owners:
+            if not isinstance(owner, (RootQuestion, SubQuestion)):
+                continue
+            known = self._owner_submodules.get((owner.__class__, owner.id), {})
+            if known:
+                self._expression_submodule_ids[(owner.__class__, owner.id)] = min(
+                    known, key=self._scope_submodule_rank
+                )
+                continue
+            root_id = (
+                owner.id if isinstance(owner, RootQuestion) else owner.root_question_id
+            )
+            unresolved_roots[root_id].append(owner)
+        if not unresolved_roots or not scope_ids:
+            return
+        submodules_by_root = defaultdict(set)
+        for root_id, submodule_id in RootQuestion.submodule.through.objects.filter(
+            rootquestion_id__in=unresolved_roots, submodule_id__in=scope_ids
+        ).values_list("rootquestion_id", "submodule_id"):
+            submodules_by_root[root_id].add(submodule_id)
+        for root_id, root_owners in unresolved_roots.items():
+            if not submodules_by_root[root_id]:
+                continue
+            submodule_id = min(
+                submodules_by_root[root_id], key=self._scope_submodule_rank
+            )
+            for owner in root_owners:
+                self._expression_submodule_ids[(owner.__class__, owner.id)] = (
+                    submodule_id
+                )
+
+    def _owner_config(self, owner):
+        submodule_id = self._expression_submodule_ids.get((owner.__class__, owner.id))
+        if submodule_id is None:
+            return None
+        resolver = self.get_config_resolver()
+        if not resolver:
+            return None
+        return config_reference(resolver.config_for(owner, submodule_id))
+
+    def _expression_owner(self, owner):
+        """Owner payload, naming the submodule configuration when one applies."""
+
+        owner_data = self._owner(owner)
+        config = self._owner_config(owner)
+        if config:
+            owner_data["config"] = config
+        return owner_data
+
+    def _expression_value(self, owner, field):
+        """Expression text as it will be emitted (effective configuration)."""
+
+        submodule_id = self._expression_submodule_ids.get((owner.__class__, owner.id))
+        if submodule_id is not None:
+            resolver = self.get_config_resolver()
+            if resolver:
+                effective = resolver.resolve(owner, submodule_id)
+                return getattr(effective, field, "") or ""
+        return getattr(owner, field, "") or ""
+
     def validate_dependencies(self):
         owners = self._scope_expression_owners()
+        self._set_expression_submodules(owners)
         references = []
         for owner in owners:
             for field in self._expression_fields(owner):
                 for name in sorted(
-                    expression_question_references(getattr(owner, field, "") or "")
+                    expression_question_references(self._expression_value(owner, field))
                 ):
                     references.append((owner, field, name))
 
@@ -498,7 +607,7 @@ class SubmoduleCompositionValidator:
                 },
                 key=lambda submodule: submodule.id,
             )
-            owner_data = self._owner(owner)
+            owner_data = self._expression_owner(owner)
             message = (
                 f"{owner_data['model']} '{owner.name}' field '{field}' references "
                 f"question '{referenced_name}', but it is not emitted by the selected survey."
@@ -506,6 +615,7 @@ class SubmoduleCompositionValidator:
             if related_submodules:
                 labels = ", ".join(submodule.label for submodule in related_submodules)
                 message += f" Select one of these submodules: {labels}."
+            message += owner_config_note(owner_data)
             self._record_dependency_result(owner, dependency, related_submodules)
 
             self.dependency_issues.append(

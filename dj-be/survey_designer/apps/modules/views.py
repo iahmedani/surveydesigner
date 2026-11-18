@@ -60,6 +60,7 @@ from questions.models import (
     RootQuestion,
     SubQuestion,
 )
+from questions.serializers import QUESTION_CONFIG_RESOLVER_CONTEXT
 from questions.services import (
     ArtifactInfrastructureError,
     ArtifactInputError,
@@ -73,6 +74,7 @@ from questions.services import (
     failed_validation_result,
     validate_generated_artifact,
 )
+from questions.services.question_config import QuestionConfigResolver
 from rest_framework import serializers, status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.generics import GenericAPIView
@@ -1005,11 +1007,30 @@ class SubmoduleViewSet(ModelViewSet):
     serializer_class = SubmoduleWithQuestionsSerializer
     permission_classes = [IsAuthenticated]
 
-    @method_decorator(cache_page(60 * 60))  # Cache for 1 hour
+    @method_decorator(
+        cache_page(60 * 60, key_prefix="modules_submodules_")
+    )  # Cache for 1 hour
     @method_decorator(vary_on_cookie)
     @method_decorator(vary_on_headers("Survey-Designer-Organizations", "Authorization"))
     def dispatch(self, *args, **kwargs):
         return super().dispatch(*args, **kwargs)
+
+    def get_serializer(self, *args, **kwargs):
+        # Load every serialized submodule's question configs in one pass, so
+        # the effective labels/choices/translations add no per-question queries.
+        instance = args[0] if args else kwargs.get("instance")
+        if instance is not None:
+            # A page (list) or a queryset (evaluated once and cached), or one object.
+            submodules = list(instance) if hasattr(instance, "__iter__") else [instance]
+            context = kwargs.pop("context", None) or self.get_serializer_context()
+            context[QUESTION_CONFIG_RESOLVER_CONTEXT] = QuestionConfigResolver(
+                (submodule.id for submodule in submodules),
+                prefetch_choice_options=True,
+            )
+            kwargs["context"] = context
+            serializer_class = self.get_serializer_class()
+            return serializer_class(*args, **kwargs)
+        return super().get_serializer(*args, **kwargs)
 
     def filter_queryset(self, queryset):
         qs = super().filter_queryset(queryset)
@@ -1227,7 +1248,9 @@ class IndicatorViewSet(ModelViewSet):
     serializer_class = IndicatorSerializer
     permission_classes = [IsAuthenticated]
 
-    @method_decorator(cache_page(60 * 60))  # Cache for 1 hour
+    @method_decorator(
+        cache_page(60 * 60, key_prefix="modules_indicators_")
+    )  # Cache for 1 hour
     @method_decorator(vary_on_cookie)
     @method_decorator(vary_on_headers("Survey-Designer-Organizations", "Authorization"))
     def dispatch(self, *args, **kwargs):
